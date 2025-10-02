@@ -2,15 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 Bybit USDT-Perp Impulse Scanner — WebSocket v5 public (linear)
-- Подписка: kline.1.<SYMBOL> (закрытие 1m)
-- Подписка: publicTrade.<SYMBOL> (дельта/кластеры)
+Soft-логика: 2 из 3 условий (цена/объём/RSI), TIER A/B, дельта/дисбаланс как подтверждение.
+Каналы:
+- kline.1.<SYMBOL>        — триггер по закрытию 1m
+- publicTrade.<SYMBOL>    — поток сделок для дельты/кластера
 
-Логика:
-- Universe берём через REST ровно как в main.py (требуется requests), чтобы выбрать топ-ликвид.
-- Сигналы триггерим по закрытию 1m (как в REST), но подтверждаем активностью из trade-потока:
-    * в последние WS_DELTA_WINDOW_SEC суммарная дельта по USDT >= WS_DELTA_MIN_USDT
-    * дисбаланс |buy/sell| >= WS_DELTA_IMBALANCE
-- Дедуп, RSI/MACD и фибо-зона — те же функции, что в REST (скопированы локально для изоляции).
+Пороги дельты смягчаются, если сигнал TIER A.
 """
 
 import os
@@ -19,7 +16,7 @@ import json
 import math
 import time
 import logging
-from collections import deque, defaultdict
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional
 
@@ -34,7 +31,7 @@ WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 logger = logging.getLogger("impulse")
 
-# -------- utils (скопировано из main.py) --------
+# -------- utils --------
 
 def ts_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -80,10 +77,9 @@ def tg_send(token: str, chat_id: str, text: str, disable_web_page_preview=True):
         logger.warning("Telegram not configured (skip)")
         return
     try:
-        import requests as _rq
-        _rq.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                 data={"chat_id": chat_id, "text": text, "parse_mode":"HTML",
-                       "disable_web_page_preview": disable_web_page_preview}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat_id, "text": text, "parse_mode":"HTML",
+                            "disable_web_page_preview": disable_web_page_preview}, timeout=10)
     except Exception as e:
         logger.warning(f"Telegram send error: {e}")
 
@@ -111,10 +107,11 @@ def load_universe(universe_max: int, min_notional: float) -> List[str]:
     return [s for s,_ in rows[:universe_max]]
 
 def fetch_ohlcv(symbol: str, interval_str: str, limit: int=350) -> Optional[pd.DataFrame]:
-    """Через REST (разово) — чтоб считать RSI/MACD/Δ по закрытой 1m свече."""
+    """Через REST (разово) — чтобы считать RSI/MACD/Δ по закрытой 1m свече."""
     intr = interval_to_bybit(interval_str)
     r = requests.get(f"{BYBIT_BASE}/v5/market/kline",
-                     params={"category":"linear","symbol":symbol,"interval":intr,"limit":str(limit)}, timeout=10)
+                     params={"category":"linear","symbol":symbol,"interval":intr,"limit":str(limit)},
+                     timeout=10)
     d = r.json()
     if d.get("retCode") != 0:
         return None
@@ -132,13 +129,12 @@ def fetch_ohlcv(symbol: str, interval_str: str, limit: int=350) -> Optional[pd.D
 # -------- WS state (дельта по сделкам) --------
 
 class DeltaWindow:
-    """Хранит сделки за N секунд и даёт buy/sell USDT сумму."""
+    """Хранит сделки за N секунд и даёт buy/sell USDT сумму + дельту."""
     def __init__(self, window_sec: int):
         self.window_sec = window_sec
         self.q: deque[Tuple[float,float,float]] = deque()  # (time_ts, buy_usdt, sell_usdt)
 
     def push_trade(self, ts: float, side: str, price: float, size: float):
-        # size — контрактный объём (в линейных обычно = baseQty). USDT = price*size
         usdt = float(price) * float(size)
         self.q.append((ts, usdt if side=="Buy" else 0.0, usdt if side=="Sell" else 0.0))
         self._trim()
@@ -157,9 +153,10 @@ class DeltaWindow:
 
 # -------- core signal check from df(1m) --------
 
-def analyze_1m(df_1m: pd.DataFrame, lookback_min:int, vol_sma:int,
-               rsi_len:int, rsi_high:float, rsi_low:float,
-               use_macd:bool, min_pct_move:float, min_vol_mult:float) -> Tuple[bool, Dict, str]:
+def analyze_1m_soft(df_1m: pd.DataFrame, lookback_min:int, vol_sma:int,
+                    rsi_len:int, rsi_high:float, rsi_low:float,
+                    use_macd:bool, min_pct_move:float, min_vol_mult:float) -> Tuple[bool, Dict, str]:
+    """2 из 3 условий + TIER A/B, MACD усиливает, но не блокирует."""
     if len(df_1m) < vol_sma + lookback_min + 3:
         return False, {}, "not_enough_history"
     close = df_1m["close"].values
@@ -172,24 +169,34 @@ def analyze_1m(df_1m: pd.DataFrame, lookback_min:int, vol_sma:int,
     if vol_sma_v==0 or math.isnan(vol_sma_v):
         return False, {}, "vol_sma_nan"
     vol_mult = last_turn / vol_sma_v
+
     ref_close = close[-(lookback_min+2)]
     move_pct = pct(last_close, ref_close)
     rsi_v = rsi(close[:-1], rsi_len)
-    _macd, _sig, hist = macd_hist(close[:-1])
+    _m, _s, hist = macd_hist(close[:-1])
 
-    is_pump = move_pct >= min_pct_move and vol_mult >= min_vol_mult and rsi_v >= rsi_high
-    is_dump = -move_pct >= min_pct_move and vol_mult >= min_vol_mult and rsi_v <= rsi_low
-    direction=None
-    if is_pump:
-        if use_macd and not (not math.isnan(hist) and hist>0):
-            return False, {}, "macd_not_confirm_pump"
-        direction="PUMP"
-    elif is_dump:
-        if use_macd and not (not math.isnan(hist) and hist<0):
-            return False, {}, "macd_not_confirm_dump"
-        direction="DUMP"
+    cond_price_up   = move_pct >= min_pct_move
+    cond_price_down = -move_pct >= min_pct_move
+    cond_vol        = vol_mult >= min_vol_mult
+    cond_rsi_up     = rsi_v >= rsi_high
+    cond_rsi_down   = rsi_v <= rsi_low
+
+    score_up   = int(cond_price_up)   + int(cond_vol) + int(cond_rsi_up)
+    score_down = int(cond_price_down) + int(cond_vol) + int(cond_rsi_down)
+
+    direction=None; score=0
+    if score_up >= 2 and score_up >= score_down:
+        direction="PUMP"; score=score_up
+    elif score_down >= 2 and score_down > score_up:
+        direction="DUMP"; score=score_down
     else:
-        return False, {}, "cond_fail"
+        return False, {}, "need_2_of_3"
+
+    macd_boost = 0
+    if not math.isnan(hist):
+        if direction=="PUMP" and hist>0: macd_boost=1
+        if direction=="DUMP" and hist<0: macd_boost=1
+    tier = "A" if score==3 else "B"
 
     body = last_high - last_low
     if body<=0:
@@ -208,6 +215,9 @@ def analyze_1m(df_1m: pd.DataFrame, lookback_min:int, vol_sma:int,
 
     details = {
         "direction": direction,
+        "tier": tier,
+        "score": score,
+        "macd_boost": macd_boost,
         "move_pct": move_pct,
         "vol_mult": vol_mult,
         "rsi": rsi_v,
@@ -222,19 +232,18 @@ def analyze_1m(df_1m: pd.DataFrame, lookback_min:int, vol_sma:int,
 # -------- runner --------
 
 async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
-                  tech_params: Dict, dedup_minutes:int):
+                  tech_params: Dict, dedup_minutes:int, sanity_drift: float):
     """
     symbols: список "ALTUSDT"
     cfg: параметры delta/imbalance окна
     tg: telegram tokens
     tech_params: тех. индикаторы (RSI/MACD/thresholds)
+    sanity_drift: допустимый контрдрейф на старшем ТФ (в %) — неригористично, проверяем 3m on demand
     """
-    # дельта по каждому символу
     deltas: Dict[str, DeltaWindow] = {s: DeltaWindow(cfg["WS_DELTA_WINDOW_SEC"]) for s in symbols}
     last_signal_at: Dict[str, datetime] = {}
 
     subs = []
-    # kline 1m + publicTrade
     subs.append({"op":"subscribe", "args":[f"kline.1.{s}" for s in symbols]})
     subs.append({"op":"subscribe", "args":[f"publicTrade.{s}" for s in symbols]})
 
@@ -254,7 +263,6 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     msg = json.loads(raw)
 
-                    # Heartbeat logs
                     if time.time() - last_hb >= heartbeat_min*60:
                         logger.info(f"[WS] alive: tracked={len(symbols)}; window={cfg['WS_DELTA_WINDOW_SEC']}s")
                         last_hb = time.time()
@@ -264,7 +272,6 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                         sym = msg["topic"].split(".")[1]
                         data = msg.get("data",[])
                         for tr in data:
-                            # fields: T=ts(ms), side=Buy/Sell, p=price, v=size
                             ts = float(tr.get("T", int(time.time()*1000)))/1000.0
                             side = tr.get("S") or tr.get("side")
                             price = float(tr.get("p"))
@@ -272,27 +279,23 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                             deltas[sym].push_trade(ts, side, price, size)
                         continue
 
-                    # kline
+                    # 1m kline close
                     if msg.get("topic","").startswith("kline.1."):
                         sym = msg["topic"].split(".")[2]
                         arr = msg.get("data",[])
-                        # Bybit шлёт список, берём последний
                         if not arr:
                             continue
                         bar = arr[-1]
-                        # confirm флаг: true, когда свеча закрылась
-                        confirm = bar.get("confirm", False)
-                        if not confirm:
-                            # свеча формируется — ждём закрытия
+                        if not bar.get("confirm", False):
                             continue
 
-                        # при закрытии 1m — тянем историю (REST) для индикаторов
+                        # закрылась 1m — подгружаем df для индикаторов
                         df_1m = fetch_ohlcv(sym, "1m", limit=max(350, tech_params["VOL_SMA"]+60))
                         if df_1m is None:
                             logger.debug(f"[{sym}] skip: no df_1m")
                             continue
 
-                        ok, info, reason = analyze_1m(
+                        ok, info, reason = analyze_1m_soft(
                             df_1m,
                             lookback_min=tech_params["LOOKBACK_MIN"],
                             vol_sma=tech_params["VOL_SMA"],
@@ -307,14 +310,30 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                             logger.debug(f"[{sym}] no-impulse (kline close): {reason}")
                             continue
 
-                        # подтверждение по дельте в последние N секунд
+                        # лёгкий sanity на 3m: допускаем контрдвиг до sanity_drift (например, 1.0%)
+                        df_3m = fetch_ohlcv(sym, "3m", limit=120)
+                        if df_3m is not None and len(df_3m) >= 5:
+                            closes = df_3m["close"].values
+                            drift = pct(closes[-2], closes[-5])
+                            if info["direction"] == "PUMP" and drift < -sanity_drift:
+                                logger.debug(f"[{sym}] fail sanity 3m: drift={drift:.3f}% < -{sanity_drift}")
+                                continue
+                            if info["direction"] == "DUMP" and drift > sanity_drift:
+                                logger.debug(f"[{sym}] fail sanity 3m: drift={drift:.3f}% > {sanity_drift}")
+                                continue
+
+                        # подтверждение по дельте за окно
                         buy_usdt, sell_usdt, delta_usdt = deltas[sym].snapshot()
                         abs_delta = abs(delta_usdt)
                         imbalance = (abs(buy_usdt) / max(1.0, abs(sell_usdt))) if sell_usdt>0 else float('inf')
 
-                        if abs_delta < cfg["WS_DELTA_MIN_USDT"] or imbalance < cfg["WS_DELTA_IMBALANCE"]:
-                            logger.debug(f"[{sym}] delta weak: |Δ|={abs_delta:.0f} < {cfg['WS_DELTA_MIN_USDT']} "
-                                         f"or imbalance={imbalance:.2f} < {cfg['WS_DELTA_IMBALANCE']}")
+                        # смягчаем пороги, если TIER A
+                        tier = info.get("tier","B")
+                        delta_min = cfg["WS_DELTA_MIN_USDT"] * (0.8 if tier=="A" else 1.0)
+                        imb_min   = cfg["WS_DELTA_IMBALANCE"] * (0.9 if tier=="A" else 1.0)
+
+                        if abs_delta < delta_min or imbalance < imb_min:
+                            logger.debug(f"[{sym}] delta weak: |Δ|={abs_delta:.0f} < {delta_min} or imb={imbalance:.2f} < {imb_min}")
                             continue
 
                         key = f"{sym}|{info['direction']}"
@@ -325,20 +344,20 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                             continue
                         last_signal_at[key] = now
 
-                        # лог + telegram
                         logger.info(
-                            f"[{sym}] SIGNAL {info['direction']} | Δ{tech_params['LOOKBACK_MIN']}m={info['move_pct']:.2f}% "
-                            f"| turn×SMA={info['vol_mult']:.2f} | RSI={info['rsi']:.1f} | "
-                            f"Δ_usdt={delta_uszt(buy_usdt, sell_usdt, delta_usdt)} | close={info['last_close']:.6f}"
+                            f"[{sym}] SIGNAL {info['direction']} | TIER={info['tier']} (score={info['score']}{' +MACD' if info.get('macd_boost') else ''}) "
+                            f"| Δ{tech_params['LOOKBACK_MIN']}m={info['move_pct']:.2f}% | turn×SMA={info['vol_mult']:.2f} | RSI={info['rsi']:.1f} | "
+                            f"Δ_usdt={delta_usdt:,.0f} (buy={buy_usdt:,.0f} / sell={sell_usdt:,.0f}) | close={info['last_close']:.6f}"
                         )
 
                         msg_text = (
-                            f"⚡️ <b>{info['direction']}</b> (WS) на <b>{sym}</b>\n"
+                            f"⚡️ <b>{info['direction']}</b> (WS, TIER {info['tier']}) на <b>{sym}</b>\n"
                             f"⏱ ТФ: 1m (закрытая свеча)\n"
                             f"📈 Δ за {tech_params['LOOKBACK_MIN']}m: <b>{info['move_pct']:.2f}%</b>\n"
                             f"🔊 Turnover xSMA({tech_params['VOL_SMA']}): <b>{info['vol_mult']:.2f}×</b>\n"
                             f"💪 RSI(1m): <b>{info['rsi']:.1f}</b>\n"
-                            f"📊 Δ window {cfg['WS_DELTA_WINDOW_SEC']}s: "
+                            f"🧮 Сила: <b>{info['score']}/3</b>{' + MACD' if info.get('macd_boost') else ''}\n"
+                            f"📊 Δ {cfg['WS_DELTA_WINDOW_SEC']}s: "
                             f"<b>buy={buy_usdt:,.0f}</b> / <b>sell={sell_usdt:,.0f}</b> / "
                             f"<b>|Δ|={abs_delta:,.0f}</b> (imb={imbalance:.2f})"
                         )
@@ -352,41 +371,39 @@ async def ws_loop(symbols: List[str], cfg: Dict[str, float], tg: Dict[str,str],
                         tg_send(tg["token"], tg["chat_id"], msg_text)
 
         except (asyncio.TimeoutError, websockets.ConnectionClosedError, websockets.InvalidStatusCode) as e:
+            reconnect_sec = int(os.getenv("WS_RECONNECT_SEC","5"))
             logger.warning(f"WS connection issue: {e}. Reconnecting in {reconnect_sec}s ...")
             await asyncio.sleep(reconnect_sec)
         except Exception as e:
+            reconnect_sec = int(os.getenv("WS_RECONNECT_SEC","5"))
             logger.exception(f"WS fatal: {e}")
             await asyncio.sleep(reconnect_sec)
 
-def delta_uszt(b,s,d):
-    # helper для красивого логирования
-    return f"{d:,.0f} (buy={b:,.0f} / sell={s:,.0f})"
-
 def run_ws_scanner():
-    # прогружаем переменные из main.py логгера уже настроены
     load_dotenv()
     # общие параметры (как в REST)
-    universe_max = int(os.getenv("UNIVERSE_MAX","100"))
-    min_notional = float(os.getenv("MIN_NOTIONAL_USDT","300000"))
-    lookback_min = int(os.getenv("LOOKBACK_MIN","3"))
+    universe_max = int(os.getenv("UNIVERSE_MAX","150"))
+    min_notional = float(os.getenv("MIN_NOTIONAL_USDT","150000"))
+    lookback_min = int(os.getenv("LOOKBACK_MIN","2"))
     vol_sma = int(os.getenv("VOL_SMA","20"))
-    min_pct_move = float(os.getenv("MIN_PCT_MOVE","3.0"))
-    min_vol_mult = float(os.getenv("MIN_VOL_MULT","5.0"))
+    min_pct_move = float(os.getenv("MIN_PCT_MOVE","2.0"))
+    min_vol_mult = float(os.getenv("MIN_VOL_MULT","3.0"))
     rsi_len = int(os.getenv("RSI_LEN","14"))
-    rsi_high = float(os.getenv("RSI_HIGH","75"))
-    rsi_low = float(os.getenv("RSI_LOW","25"))
-    use_macd = os.getenv("USE_MACD","1")=="1"
-    dedup_minutes = int(os.getenv("DEDUP_MINUTES","10"))
+    rsi_high = float(os.getenv("RSI_HIGH","70"))
+    rsi_low = float(os.getenv("RSI_LOW","30"))
+    use_macd = os.getenv("USE_MACD","0")=="1"
+    dedup_minutes = int(os.getenv("DEDUP_MINUTES","5"))
+    sanity_drift = float(os.getenv("SANITY_DRIFT_PCT","1.0"))  # допуск контрдвижения на 3m
 
-    # ws-специфика
+    # ws-специфика с более мягкими дефолтами
     cfg = {
-        "WS_DELTA_WINDOW_SEC": int(os.getenv("WS_DELTA_WINDOW_SEC","10")),
-        "WS_DELTA_MIN_USDT": float(os.getenv("WS_DELTA_MIN_USDT","50000")),
-        "WS_DELTA_IMBALANCE": float(os.getenv("WS_DELTA_IMBALANCE","1.8")),
+        "WS_DELTA_WINDOW_SEC": int(os.getenv("WS_DELTA_WINDOW_SEC","8")),
+        "WS_DELTA_MIN_USDT": float(os.getenv("WS_DELTA_MIN_USDT","15000")),
+        "WS_DELTA_IMBALANCE": float(os.getenv("WS_DELTA_IMBALANCE","1.4")),
     }
     tg = {"token": os.getenv("TELEGRAM_BOT_TOKEN",""), "chat_id": os.getenv("TELEGRAM_CHAT_ID","")}
 
-    logger.info("WS mode starting...")
+    logger.info("WS mode starting (soft thresholds)...")
     symbols = load_universe(universe_max, min_notional)
     logger.info(f"WS universe: {len(symbols)} symbols")
     tg_send(tg["token"], tg["chat_id"], f"🚀 <b>Impulse Scanner</b> (WS) запущен {ts_now_iso()}\nВсего в юниверсе: <b>{len(symbols)}</b> пар")
@@ -402,4 +419,4 @@ def run_ws_scanner():
         "MIN_VOL_MULT": min_vol_mult,
     }
 
-    asyncio.run(ws_loop(symbols, cfg, tg, tech_params, dedup_minutes))
+    asyncio.run(ws_loop(symbols, cfg, tg, tech_params, dedup_minutes, sanity_drift))

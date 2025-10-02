@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bybit USDT-Perp Impulse Scanner (pump/dump) — direct REST v5 (без ccxt)
-С расширенным логированием + переключателем режимов:
-- SCAN_MODE=rest  — REST-сканер (как раньше)
-- SCAN_MODE=ws    — WebSocket-сканер (использует ws_scanner.py)
+Bybit USDT-Perp Impulse Scanner — REST v5 (без ccxt)
+Версия: soft-signals (2 из 3 условий + TIER A/B), расширенные логи и переключатель режимов.
 
-ENV (дополнительно к существующим):
+Переключатель режимов:
+- SCAN_MODE=rest  — этот файл (REST-сканер)
+- SCAN_MODE=ws    — WebSocket-сканер из ws_scanner.py
+
+ENV (доп. к существующим):
 - LOG_LEVEL=INFO|DEBUG|WARNING|ERROR
 - LOG_FILE=1 (писать в logs/bot.log с ротацией)
 - LOG_SYMBOL_FILTER=SOLUSDT,PEPEUSDT (детальный DEBUG только по перечисленным символам)
+
+Рекомендации для «чаще сигналов» в .env:
+UNIVERSE_MAX=150
+MIN_NOTIONAL_USDT=150000
+MIN_PCT_MOVE=2.0
+MIN_VOL_MULT=3.0
+RSI_HIGH=70
+RSI_LOW=30
+USE_MACD=0
+LOOKBACK_MIN=2
+DEDUP_MINUTES=5
+ANOMALY_24H_PCT_MAX=200
+CYCLE_SLEEP_SEC=15
 """
 
 import os
 import time
 import math
-import json
-import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
@@ -251,7 +264,8 @@ class ImpulseScanner:
         try:
             kl = self.api.get_kline(symbol, interval, limit=limit)
             if not kl or len(kl) < max(self.vol_sma + self.lookback_min + 3, 50):
-                logger.debug(f"[{symbol} {tf_str}] not enough candles: {len(kl) if kl else 0}")
+                if logger.level <= logging.DEBUG or (self.symbol_filter and symbol in self.symbol_filter):
+                    logger.debug(f"[{symbol} {tf_str}] not enough candles: {len(kl) if kl else 0}")
                 return None
             rows = []
             for rec in kl:
@@ -279,31 +293,32 @@ class ImpulseScanner:
             return True
         return False
 
-    # ---------- Core signal ----------
+    # ---------- Core signal (SOFT: 2-of-3 + TIER) ----------
 
     def _analyze_1m_impulse(self, symbol: str, df_1m: pd.DataFrame) -> Tuple[bool, Dict, str]:
         """
         Возвращает (ok, details, reason_if_not_ok)
+        Смягчено: "2 из 3" условий (цена/объём/RSI) + градация силы (tier).
+        MACD (если включён) добавляет "силу", но не блокирует.
         """
         if len(df_1m) < self.vol_sma + self.lookback_min + 3:
             return False, {}, "not_enough_history"
 
         close = df_1m["close"].values
-        high = df_1m["high"].values
-        low = df_1m["low"].values
-        turn = df_1m["turnover"].values
+        high  = df_1m["high"].values
+        low   = df_1m["low"].values
+        turn  = df_1m["turnover"].values
 
         last_close = close[-2]
-        last_high = high[-2]
-        last_low = low[-2]
-        last_turn = turn[-2]
+        last_high  = high[-2]
+        last_low   = low[-2]
+        last_turn  = turn[-2]
 
         vol_sma = pd.Series(turn[:-1]).rolling(self.vol_sma).mean().iloc[-1]
         if vol_sma == 0 or np.isnan(vol_sma):
             return False, {}, "vol_sma_nan_or_zero"
 
         vol_mult = last_turn / vol_sma
-
         k = self.lookback_min
         ref_close = close[-(k+2)]
         move_pct = pct(last_close, ref_close)
@@ -311,22 +326,36 @@ class ImpulseScanner:
         rsi_val = rsi(close[:-1], self.rsi_len)
         _macd, _sig, hist = macd_hist(close[:-1])
 
-        is_pump = move_pct >= self.min_pct_move and vol_mult >= self.min_vol_mult and rsi_val >= self.rsi_high
-        is_dump = (-move_pct) >= self.min_pct_move and vol_mult >= self.min_vol_mult and rsi_val <= self.rsi_low
+        # три базовых условия
+        cond_price_up   = move_pct >= self.min_pct_move
+        cond_price_down = -move_pct >= self.min_pct_move
+        cond_vol        = vol_mult >= self.min_vol_mult
+        cond_rsi_up     = rsi_val >= self.rsi_high
+        cond_rsi_down   = rsi_val <= self.rsi_low
 
-        if not (is_pump or is_dump):
-            reason = []
-            if abs(move_pct) < self.min_pct_move: reason.append("move_pct_small")
-            if vol_mult < self.min_vol_mult:      reason.append("vol_mult_small")
-            if rsi_val < self.rsi_high and rsi_val > self.rsi_low: reason.append("rsi_midrange")
-            return False, {}, "+".join(reason) or "no_conditions"
+        score_up   = int(cond_price_up)   + int(cond_vol) + int(cond_rsi_up)
+        score_down = int(cond_price_down) + int(cond_vol) + int(cond_rsi_down)
 
-        direction = "PUMP" if is_pump else "DUMP"
-        if self.use_macd:
-            if direction == "PUMP" and not (not math.isnan(hist) and hist > 0):
-                return False, {}, "macd_not_confirm_pump"
-            if direction == "DUMP" and not (not math.isnan(hist) and hist < 0):
-                return False, {}, "macd_not_confirm_dump"
+        direction = None
+        score = 0
+        if score_up >= 2 and score_up >= score_down:
+            direction = "PUMP"
+            score = score_up
+        elif score_down >= 2 and score_down > score_up:
+            direction = "DUMP"
+            score = score_down
+        else:
+            return False, {}, "need_2_of_3"
+
+        # MACD — усиливает, но не блокирует
+        macd_boost = 0
+        if not math.isnan(hist):
+            if direction == "PUMP" and hist > 0:
+                macd_boost = 1
+            if direction == "DUMP" and hist < 0:
+                macd_boost = 1
+
+        tier = "A" if score == 3 else "B"  # A=сильный, B=средний
 
         body = last_high - last_low
         if body <= 0:
@@ -345,6 +374,9 @@ class ImpulseScanner:
 
         details = {
             "direction": direction,
+            "tier": tier,
+            "score": score,
+            "macd_boost": macd_boost,
             "move_pct": move_pct,
             "vol_mult": vol_mult,
             "rsi": rsi_val,
@@ -360,7 +392,7 @@ class ImpulseScanner:
 
     def run(self):
         logger.info("Initializing REST scanner...")
-        tg_send(self.bot_token, self.chat_id, f"🚀 <b>Impulse Scanner</b> (Bybit REST) запущен {ts_now_iso()}")
+        tg_send(self.bot_token, self.chat_id, f"🚀 <b>Impulse Scanner</b> (REST) запущен {ts_now_iso()}")
 
         tickers = self.api.get_linear_tickers()
         tickers_map = {t["symbol"]: t for t in tickers}
@@ -389,7 +421,8 @@ class ImpulseScanner:
 
                     ch24 = self._ticker_pct24(tickers_map, symbol)
                     if abs(ch24) > self.anomaly_24h:
-                        logger.debug(f"{short_prefix} skip: 24h_anomaly={ch24:.2f}% > {self.anomaly_24h}%")
+                        if logger.level <= logging.DEBUG or (self.symbol_filter and symbol in self.symbol_filter):
+                            logger.debug(f"{short_prefix} skip: 24h_anomaly={ch24:.2f}% > {self.anomaly_24h}%")
                         continue
 
                     df_1m = self._fetch_ohlcv_df(symbol, "1m", limit=max(300, self.vol_sma + 50))
@@ -402,7 +435,7 @@ class ImpulseScanner:
                             logger.debug(f"{short_prefix} no-impulse: reason={reason}")
                         continue
 
-                    # sanity-check старших ТФ
+                    # sanity-check старших ТФ (смягчённый): допускаем контрдвиг до 1.0%
                     senior_ok = True
                     for tf in [tf for tf in self.timeframes if tf != "1m"]:
                         df = self._fetch_ohlcv_df(symbol, tf, limit=200)
@@ -412,15 +445,15 @@ class ImpulseScanner:
                         if len(closes) < 5:
                             continue
                         drift = pct(closes[-2], closes[-5])  # ~4 свечи назад
-                        if info["direction"] == "PUMP" and drift < 0:
+                        if info["direction"] == "PUMP" and drift < -1.0:
                             senior_ok = False
                             if logger.level <= logging.DEBUG or (self.symbol_filter and symbol in self.symbol_filter):
-                                logger.debug(f"{short_prefix} fail sanity {tf}: drift={drift:.3f}% < 0 for PUMP")
+                                logger.debug(f"{short_prefix} fail sanity {tf}: drift={drift:.3f}% < -1.0 for PUMP")
                             break
-                        if info["direction"] == "DUMP" and drift > 0:
+                        if info["direction"] == "DUMP" and drift > 1.0:
                             senior_ok = False
                             if logger.level <= logging.DEBUG or (self.symbol_filter and symbol in self.symbol_filter):
-                                logger.debug(f"{short_prefix} fail sanity {tf}: drift={drift:.3f}% > 0 for DUMP")
+                                logger.debug(f"{short_prefix} fail sanity {tf}: drift={drift:.3f}% > 1.0 for DUMP")
                             break
                         time.sleep(0.03)
                     if not senior_ok:
@@ -428,11 +461,13 @@ class ImpulseScanner:
 
                     key = f"{symbol}|{info['direction']}"
                     if not self._dedup_ok(key):
-                        logger.debug(f"{short_prefix} dedup: skip repeated signal")
+                        if logger.level <= logging.DEBUG or (self.symbol_filter and symbol in self.symbol_filter):
+                            logger.debug(f"{short_prefix} dedup: skip repeated signal")
                         continue
 
                     logger.info(
                         f"{short_prefix} SIGNAL {info['direction']} | "
+                        f"TIER={info['tier']} (score={info['score']}{' +MACD' if info.get('macd_boost') else ''}) | "
                         f"Δ{self.lookback_min}m={info['move_pct']:.2f}% | "
                         f"turn×SMA={info['vol_mult']:.2f} | RSI={info['rsi']:.1f} | "
                         f"MACD_hist={info['macd_hist'] if not math.isnan(info['macd_hist']) else 'NaN'} | "
@@ -440,13 +475,14 @@ class ImpulseScanner:
                     )
 
                     msg = (
-                        f"⚡️ <b>{info['direction']}</b> стартует на <b>{symbol}</b>\n"
+                        f"⚡️ <b>{info['direction']}</b> (TIER {info['tier']}) на <b>{symbol}</b>\n"
                         f"⏱ ТФ: 1m (подтв: {', '.join(self.timeframes)})\n"
                         f"📈 Δ за {self.lookback_min}m: <b>{info['move_pct']:.2f}%</b>\n"
                         f"🔊 Turnover xSMA({self.vol_sma}): <b>{info['vol_mult']:.2f}×</b>\n"
-                        f"💪 RSI(1m): <b>{info['rsi']:.1f}</b>"
+                        f"💪 RSI(1m): <b>{info['rsi']:.1f}</b>\n"
+                        f"🧮 Сила: <b>{info['score']}/3</b>{' + MACD' if info.get('macd_boost') else ''}"
                     )
-                    if self.use_macd and not math.isnan(info["macd_hist"]):
+                    if not math.isnan(info["macd_hist"]):
                         msg += f"\n📉 MACD hist: <b>{info['macd_hist']:+.4f}</b>"
                     msg += (
                         f"\n\n💵 Цена(закр. 1m): <b>{info['last_close']:.6f}</b>"
@@ -470,7 +506,6 @@ if __name__ == "__main__":
     mode = os.getenv("SCAN_MODE", "rest").lower()
     try:
         if mode == "ws":
-            # ленивый импорт, чтобы не требовать websockets в REST-режиме
             from ws_scanner import run_ws_scanner
             logger.info("Starting in WS mode...")
             run_ws_scanner()
